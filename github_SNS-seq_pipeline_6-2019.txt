@@ -1,0 +1,196 @@
+##############################################################################
+# SNS-seq analysis pipeline 
+# 
+# Developed by Benoit Ballester and modified by Ildem Akerman and Marie Artufel 
+# 
+# 28-5-2019 
+##############################################################################
+#
+# Introduction
+# This protocol was originally developed by Benoit Ballester and modified by Marie Artufel and Ildem Akerman
+# SNS-seq is a method that maps DNA replication initiation sites by sequencing nascent DNA that is produced at start sites 
+# Nascent DNA contains an RNA-primed beginning, hence is protected from digestion 
+#
+# Most SNS-seq protocols use 50-100 bp, single-end reads usually sequenced at 90-150M reads / sample 
+# We recommend a read depth of 150 M reads/sample for the human genome, and > 90M/sample for mouse genomes. 
+#
+# Please note that this pipeline is for 50 bp reads for the human genome - some parameters may need to shange for different read lengths and genomes. 
+
+#########################################
+# QUALITY CONTROL, TRIMMING AND ALIGNMENT 
+################### Required applications: FastQC, bbduk or trimmmatic and bowtie2, Samtools  
+##########################################
+ 
+# Check the quality of your reads in a fastq file using FastQC
+fastqc yourFastqFile.fastq 
+
+# Trim reads based on quality
+#can use trimmomatic or bbduk suite to trim the reads based on quality 
+#http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/TrimmomaticManual_V0.32.pdf
+#https://jgi.doe.gov/data-and-tools/bbtools/bb-tools-user-guide/bbduk-guide/ 
+
+#Align your reads to the genome  
+#bowtie2 build the genome 
+bowtie2-build --threads 6 -f hg38.fa hg38.bt2 
+
+#Now run the bowtie2 
+bowtie2 --end-to-end --sensitive -N 0 -x hg38.bt2  -U yourFastqFile.fastq  -S OutputFileinSamFormat.sam
+#hg38.bt2  is the genome index file 
+
+#this will result in a sam file that can be converted to a bam file and generate an index using SAMtools 
+#go to the folder that contains all the SAM files 
+
+for file in *.sam
+do
+samtools view -S -b ${file} | samtools sort -o "${file}".bam
+samtools index "${file}".bam
+done
+########################################
+# PEAK CALLING to determine origin positions 
+################### Required applications: MACS2, SICER, bamtobed (UCSC), bedtools  
+########################################
+
+#We use a combination of two algorithms to call peaks. 
+#First call peaks in MACS2 for all bam files using the appropiate RNASE+lambdaexonuclease control 
+for file in *.bam
+do
+macs2 callpeak -t ${file} -c BackgroundFile.bam -f BAM -n "${file}"_vs_ctl --outdir yourFolder/MACS2 --bw 500 -p 1e-3 -s 60 -m 10 30 --gsize 2.7e9
+done
+# --gsize is 2.3e9 for the mouse genome, and will be different for each genome. This is the mapable genome size. 
+# The .narrowPeaks is the list of regions that are called origins. This number is between 20,000-60,000.  
+
+#Next call peaks using SICER 
+#Please note that SICER is an old peak-calling algorithm and its genome data base needs to be updated to contain hg38 or your genome. 
+# It accepts bed files that are made from BAM files 
+#First convert bam files into bed format 
+for file in *.bam
+do
+bamToBed -i ${file} > "${file}".bed
+done
+
+## in bash, concatanate all the bed files that belong to one cell type. 
+cat celltype1rep1.bed celltype1rep2.bed > celltype1.bed 
+ 
+# run SICER 
+SICER.sh . celltype1.bed backgroundCelltype1.bed . hg38 1 200 150 0.85 600 1e-3
+OR 
+SICER.sh . ES_merged.bed RNASE_ctl.bam.bed . mm10 1 200 500 0.83 600 0.01
+
+# Finally intersect peaks from the MACS2 with that of SICER to retain ONLY those peaks that are called by both algorithms. In doing so, retain the coordinates from MACS2 
+# Do this for each sample, using the SICER peaks for the cell type. 
+bedtools intersect -wa -u -a MACS2peaksCelltype1rep1.bed -b SICERpeaks.bed > Celltype1rep1_MACS2inSICER.bed 
+bedtools intersect -wa -u -a MACS2peaksCelltype1rep2.bed -b SICERpeaks.bed > Celltype1rep2_MACS2inSICER.bed
+# etc... 
+
+
+# For a single cell type, all origin coordinates can be merged to have a universal set of origins that may be active in at least one replicate of this cell type.
+# We have in the past only used origins that were active in 2/3 samples. 
+# This can be done using bedtools merge command. 
+# We also recommend to NAME each origin. i.e. HO1, HO2 ...  
+ 
+###################################################
+# DETERMINING SUMMITS USING ALL SAMPLES  
+################### Required applications:  bedtools, deeptools, R  
+###################################################
+# Use bedtools to define the peak of reads across samples
+
+#First merge all peaks using the cat command and bedtools merge. 
+
+#then sort the files in bash and make windows of 50 bp 
+#bash command
+sort -V -k1,1 -k2,2n All_origins.bed > Human_origins_hg38.bed
+#bedtools
+bedtools makewindows -b Human_origins_hg38.bed -w 50 -s 25 > HO_fragmented_50bp.bed
+
+#Use the fragmented file to calculate number of reads in each bin using deeptools  
+#deeptools
+multiBamSummary BED-file --BED HO_fragmented_50bp.bed -p 4 --bamfiles *.bam --outRawCounts readCounts_fragmented_HO.tab -out deleteme.npz 
+
+#then bedtools to merge the counts with the original bed file containing names of origins. 
+bedtools intersect -wa -wb -a Human_origins_hg38.bed -b readCounts_fragmented_HO.bed > HO_readCountsOfFragments_50bp_merged.txt
+
+
+#### Read into R ###########################   
+library(data.table)
+library(dplyr)
+x <- fread("HO_readCountsOfFragments_50bp_merged.txt")
+x$mean <- rowMeans(x[,8:26])
+x <- x[,c(1:7,27)]
+colnames(x) <- c("chr","start","end","name","chrF","startF","endF","mean")
+#now sort to the score, and retain only the highest score
+summits <- aggregate(mean ~ name, data = x, max)
+colnames(summits) < - c("name","mean")
+# Alternative usage  : aggregate(df$Value, by = list(df$Gene), max)
+#now take the middle base as the summit
+
+s <- merge(summits,x, by=c("name","mean"), all=FALSE)
+x <- unique(setDT(s), by = "name")
+#for about 1-3 % of origins i find multiple summit bins that are highest. We will jsut take the first on the watson strand. whatelse, there is no specific point
+x$summitstart <- x$startF + 24
+x$summitend <- x$summitstart + 1 
+
+summits <- x[,c(3,9,10,1)]
+write.table(summits, file = "HO_summits_hg38.bed", sep="\t", quote=F, row.names=F, col.names=F)
+#####################################################################################################################################################################
+
+
+##############################################
+# Quantification and Differential origin usage   
+################### Required applications:  R (DiffBind, DeSeq2)  
+#by Marie Artufel, modification by Ildem Akerman
+#############################################
+
+
+library(DiffBind)
+library(DESeq2)
+#######################################################
+#Differential usage of origins in different samples 
+###########################################################
+# In order to use DiffBind, one needs to make a csv file with information on their datafiles. 
+#see example
+
+samples <- dba(sampleSheet = "csv-file")
+count <- dba.count(samples, score=DBA_SCORE_TMM_MINUS_FULL) 
+
+# Retrieve the normalized count for each merging region
+peakset <- dba.peakset(count,bRetrieve=TRUE,DataType = DBA_DATA_FRAME,writeFile = "count_peaks_file")
+
+# Setting the comparison you want to do (here this is between condition)
+# minMembers : min number of replicates
+# bNot = T : to get all the results even those which not pass the threshold (be carefull because this paremeters could change depending on your package version)
+contrast <- dba.contrast(count, categories=DBA_CONDITION,minMembers = 2,bNot = T)
+
+# Make the analyses with DESQ2
+analyze.DESEQ2 <- dba.analyze(contrast,method = DBA_DESEQ2)
+            
+# Then get the reports
+# contrast : number of your comparison (just one in case of you have only one comparison to do)
+# th : this is the FDR threshold ( I set 2 to have all the results even non significant results)
+report = dba.report(analyze.DESEQ2,contrast =1,method = DBA_DESEQ2,th = 2)
+
+###################################################
+### NORMALISED COUNTS FOR ALL ORIGINS AND SAMPLES 
+###################################################
+
+#generate DBA object and count reads
+samples <- dba(sampleSheet = "csv-file")
+count <- dba.count(samples, score=DBA_SCORE_TMM_MINUS_FULL, fragmentSize=0, bRemoveDuplicates=FALSE, bScaleControl=TRUE)
+
+#fragmentSize=0 uses the fragment size present in the BAM file, no extension.
+#bRemoveDuplicates=FALSE   if not counting gets problematic forBAM files with variable read-lengths. 
+#bScaleControl=TRUE equalises the read depth in control and sample 
+
+# Retrieve the normalized counts
+peakset <- dba.peakset(count, bRetrieve=TRUE, DataType = DBA_DATA_FRAME, writeFile = "Peak_counts_V1_TMMminusFULL.txt")
+
+
+
+
+
+
+
+
+
+
+
+
