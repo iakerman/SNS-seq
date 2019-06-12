@@ -3,6 +3,9 @@
 # 
 # Developed by Benoit Ballester and modified by Ildem Akerman and Marie Artufel 
 # 
+# The following pipeline was compiled by Ildem Akerman 
+# PMID: 26560631 (original pipeline) then Akerman et al. 2019 (in review) 
+# 
 # 28-5-2019 
 ##############################################################################
 #
